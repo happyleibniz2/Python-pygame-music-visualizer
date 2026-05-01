@@ -21,6 +21,15 @@ This is not a direct clone, but an independent implementation inspired by simila
 
 ---
 
+## Preview
+
+### Letter Mode
+[![Letter Mode](eyecandy/lm.png)](eyecandy/letter%20mode.mp4)
+
+### Normal + Phonk Mode
+[![Normal + Phonk Mode](eyecandy/nmapm.png)](eyecandy/normal%20mode%20and%20phonk%20mode.mp4)
+
+
 ## Features
 
 ### Audio Processing

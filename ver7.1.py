@@ -726,22 +726,23 @@ def draw_letter_visualizer_enhanced(screen, final_bars, shake, glow_surf, on_bea
             pdy = y1 + ndy * ph
             pygame.draw.circle(screen, (255, 255, 255), (int(pdx), int(pdy)), 2)
     
-    # --- Avee Player Style RGB/Trail Effect (最后绘制，确保在最上层) ---
     if letter_trail_mode and letter_mode and on_beat:
         # 根据 beat_confidence 动态调整强度
         intensity = min(1.0, beat_confidence * 1.2)
         
         # 三层残影：红、绿、蓝
         layers = [
-            {"color": (255, 50, 80), "offset_mult": 8, "alpha": 70},   # 红
-            {"color": (80, 255, 80), "offset_mult": 5, "alpha": 55},   # 绿
-            {"color": (60, 100, 255), "offset_mult": 2, "alpha": 40},  # 蓝
-        ]
+        {"color": (255, 40, 80), "offset_mult": 18, "alpha": 90},
+        {"color": (80, 255, 120), "offset_mult": 12, "alpha": 70},
+        {"color": (60, 120, 255), "offset_mult": 6, "alpha": 55},
+    ]
         
         for layer in layers:
             # 偏移量随 beat 强度变化
-            offset_x = random.randint(-layer["offset_mult"], layer["offset_mult"]) * intensity
-            offset_y = random.randint(-layer["offset_mult"], layer["offset_mult"]) * intensity
+            angle = time.time() * 8 + i * 0.02
+
+            offset_x = math.cos(angle) * layer["offset_mult"] * intensity
+            offset_y = math.sin(angle) * layer["offset_mult"] * intensity
             
             trail_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
             
@@ -771,7 +772,7 @@ def draw_letter_visualizer_enhanced(screen, final_bars, shake, glow_surf, on_bea
                 pygame.draw.line(trail_surf, layer["color"], (x1, y1), (ox, oy), 4)
             
             trail_surf.set_alpha(int(layer["alpha"] * intensity))
-            screen.blit(trail_surf, (0, 0))
+            screen.blit(trail_surf, (0, 0), special_flags=pygame.BLEND_ADD)
 
 # ------------------------
 # MAIN

@@ -782,6 +782,204 @@ screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
 pygame.display.set_caption("viz")
 clock = pygame.time.Clock()
 
+# ------------------------
+# WARNING SEQUENCE
+# ------------------------
+def show_warning_sequence():
+    warnings = [
+        [
+            "WARNING",
+            "",
+            "",
+            "",
+            "Please read before playing.",
+            "",
+            "A very small percentage of people may experience epileptic seizures when exposed",
+            "to certain light patterns or flashing lights.",
+            "Exposure to certain patterns or backgrounds on a screen may trigger epileptic seizures",
+            "or loss of consciousness.",
+            "These conditions may trigger previously undetected epileptic symptoms even in",
+            "persons who have no history of seizures.",
+            "If you or anyone in your family has experienced symptoms linked to epilepsy,",
+            "consult a doctor before use.",
+            "If you experience dizziness, altered vision,eye or muscle twitching, loss of awareness,",
+            "disorientation, involuntary movement,or convulsions, stop immediately and consult a doctor."
+        ],
+
+        [
+            "警告：请在使用前阅读",
+            "",
+            "",
+            "",
+            "当暴露在特定光影图案或闪光光亮下时，有极小部分人群会引发癫痫。",
+            "这种情形可能是由于某些未查出的癫痫症状引起，即使该人员并没有",
+            "患癫痫病史也有可能造成此类病症。",
+            "如果您的家人或任何家庭成员曾有过类似症状，请在进行游戏前咨询",
+            "您的医生或医师。",
+            "如果您在使用过程中出现任何症状，包括头晕、目眩、眼部或肌肉抽搐、",
+            "失去意识、失去方向感、抽搐或出现任何自己无法控制的动作，",
+            "请立即停止使用并咨询医生。",
+            ""
+        ],
+
+        [
+            "ADVERTENCIA",
+            "",
+            "Una pequeña cantidad de personas puede sufrir ataques epilépticos al exponerse",
+            "a ciertos patrones visuales o luces intermitentes.",
+            "Incluso personas sin antecedentes de epilepsia pueden experimentar síntomas",
+            "provocados por ciertos efectos visuales.",
+            "Si usted o algún miembro de su familia ha presentado síntomas similares,",
+            "consulte a un médico antes de usar este programa.",
+            "Si experimenta mareos, espasmos musculares, desorientación, pérdida de conciencia",
+            "o movimientos involuntarios, detenga el uso inmediatamente.",
+            ""
+        ]
+    ]
+
+    title_font = get_font(48, True)
+    text_font = get_font(20)
+
+    fade_time = 1.2
+    hold_time = 4.0
+
+    for block in warnings:
+
+        start = time.time()
+        finished = False
+
+        while not finished:
+
+            now = time.time()
+            t = now - start
+
+            for event in pygame.event.get():
+
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    raise SystemExit
+
+                if event.type == pygame.KEYDOWN:
+
+                    if event.key == pygame.K_ESCAPE:
+                        pygame.quit()
+                        raise SystemExit
+
+            # ------------------------
+            # ALPHA ANIMATION
+            # ------------------------
+            if t < fade_time:
+
+                alpha = int((t / fade_time) * 255)
+
+            elif t < fade_time + hold_time:
+
+                alpha = 255
+
+            elif t < fade_time * 2 + hold_time:
+
+                alpha = int(
+                    255 - (
+                        (t - fade_time - hold_time)
+                        / fade_time
+                    ) * 255
+                )
+
+            else:
+
+                finished = True
+                continue
+
+            # ------------------------
+            # BACKGROUND
+            # ------------------------
+            screen.fill((0, 0, 0))
+
+            # subtle animated red line
+            flash = abs(math.sin(time.time() * 2))
+
+            line_color = (
+                255,
+                int(30 + flash * 100),
+                int(30 + flash * 100)
+            )
+
+            line_surf = pygame.Surface(
+                (WIDTH - 240, 3),
+                pygame.SRCALPHA
+            )
+
+            line_surf.fill((*line_color, alpha))
+
+            screen.blit(
+                line_surf,
+                (120, HEIGHT // 2 - 90)
+            )
+
+            # ------------------------
+            # TITLE
+            # ------------------------
+            title = title_font.render(
+                block[0],
+                True,
+                (255, 60, 60)
+            )
+
+            title.set_alpha(alpha)
+
+            screen.blit(
+                title,
+                title.get_rect(
+                    center=(WIDTH // 2, HEIGHT // 2 - 140)
+                )
+            )
+
+            # ------------------------
+            # BODY TEXT
+            # ------------------------
+            line_height = 26
+
+            total_height = len(block[1:]) * line_height
+
+            y = HEIGHT // 2 - total_height // 2 + 20
+
+            for line in block[1:]:
+
+                surf = text_font.render(
+                    line,
+                    True,
+                    (220, 220, 220)
+                )
+
+                surf.set_alpha(alpha)
+
+                screen.blit(
+                    surf,
+                    surf.get_rect(
+                        center=(WIDTH // 2, y)
+                    )
+                )
+
+                y += line_height
+
+            # ------------------------
+            # OPTIONAL SCANLINES
+            # ------------------------
+            for sy in range(0, HEIGHT, 4):
+
+                pygame.draw.line(
+                    screen,
+                    (12, 12, 12),
+                    (0, sy),
+                    (WIDTH, sy)
+                )
+
+            pygame.display.flip()
+            clock.tick(60)
+
+# play warning sequence before main program
+show_warning_sequence()
+
 glow_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
 running = True

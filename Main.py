@@ -1,3 +1,14 @@
+# ---------------------------------------------------------------------------
+# AVEE PLAYER PY • GPU EDITION
+# Pixel work moved off the CPU onto OpenGL (moderngl + GLSL 330):
+#   bars / peak dots / particles -> instanced quads (one draw call each)
+#   cover disc + halo, background grid -> fragment shaders
+#   glow, soft blur, motion blur, mirror, color correction, RGB split
+#     -> single fullscreen composite pass over RGBA16F FBOs
+#   UI panel -> rendered by pygame into an overlay texture (~10 Hz)
+# ---------------------------------------------------------------------------
+import os
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 import numpy as np
 import soundfile as sf
@@ -90,7 +101,8 @@ class RenderState:
         self.shake = np.array([0.0, 0.0])
         self.rotation = 0.0
         self.time = 0.0
-        self.original_cover = None
+        self.original_cover = None      # raw RGBA bytes for GL upload
+        self.cover_size = None          # (w, h) of that buffer
         self.path_mode_index = 1
         self.flux_history = []
 
@@ -98,6 +110,9 @@ class RenderState:
     def path_mode(self):
         return PATH_MODES[self.path_mode_index % len(PATH_MODES)]
 
+
+play_channel = None
+play_start_monotonic = None
 
 RS = RenderState()
 data, samplerate, sound = None, None, None
@@ -123,7 +138,7 @@ def _poll_play_pos(channel):
         with play_pos_lock:
             play_pos_ms = None
         # leave play_start_monotonic intact; reload_audio will reset it
-title, artist = "Avee Pygame", "Pure CPU Visualizer"
+title, artist = "Avee Pygame", "GPU Shader Visualizer"
 volume = 0.82
 show_ui = True
 
@@ -150,7 +165,15 @@ def get_font(size, bold=False):
 
 # -------------------------------------------------------------------------
 # AVEE-LIKE NODE ARCHITECTURE (Element & Composition)
+# Elements no longer blit pixels: they *produce GPU data* (vec4-packed
+# instance buffers / textures) and the GlRenderer executes them on the card.
 # -------------------------------------------------------------------------
+import moderngl
+import gl_shaders as SH
+
+TAU = math.tau
+
+
 class Element:
     def __init__(self):
         self.enabled = True
@@ -158,38 +181,13 @@ class Element:
     def update(self, rs: RenderState):
         pass
 
-    def render(self, surface: pygame.Surface, rs: RenderState):
-        pass
-
-
-class Composition(Element):
-    def __init__(self):
-        super().__init__()
-        self.children = []
-
-    def add(self, child):
-        self.children.append(child)
-
-    def update(self, rs):
-        for c in self.children:
-            if c.enabled:
-                c.update(rs)
-
-    def render(self, surface, rs):
-        for c in self.children:
-            if c.enabled:
-                c.render(surface, rs)
-
 
 class AudioDataProviderElement(Element):
     def __init__(self):
         super().__init__()
         self.shake_target = np.array([0.0, 0.0])
-        # no per-frame audio queries; use background poller
 
     def update(self, rs: RenderState):
-        # Drive `rs.time` from the cached playback position provided by the
-        # background poller thread. Fallback to dt when no valid position.
         global play_pos_ms, play_start_monotonic
         pos = None
         with play_pos_lock:
@@ -197,17 +195,13 @@ class AudioDataProviderElement(Element):
         if data is not None and sound and pos is not None and pos >= 0:
             rs.time = pos / 1000.0
         elif play_start_monotonic is not None:
-            # Fallback to monotonic time since we started playback; keeps
-            # visuals roughly in sync even if get_pos temporarily fails.
             rs.time = time.monotonic() - play_start_monotonic
         else:
             rs.time += rs.dt
         if data is not None and sound and pygame.mixer.get_busy():
-            # apply user-configurable visualization offset (ms)
             idx = int((rs.time + (AUDIO_VIS_OFFSET_MS / 1000.0)) * samplerate)
             if idx + 2048 < len(data):
                 chunk = data[idx:idx + 2048]
-                # compute RMS from raw PCM chunk (matches Avee behavior)
                 try:
                     rs.rms = float(np.sqrt(np.mean(chunk.astype(float) ** 2)))
                 except Exception:
@@ -216,17 +210,15 @@ class AudioDataProviderElement(Element):
                 if len(rs.rms_history) > 46:
                     rs.rms_history.pop(0)
                 fft_raw = np.abs(np.fft.rfft(chunk * WINDOW))
-                for b in range(SAMPLE_COUNT):
-                    lo, hi = _bar_lo[b], _bar_hi[b]
-                    if hi > lo:
-                        rs.fft[b] = np.mean(fft_raw[lo:min(hi, len(fft_raw))])
-                    elif lo < len(fft_raw):
-                        rs.fft[b] = fft_raw[lo]
+                lo_i, hi_i = _bar_lo[:SAMPLE_COUNT], _bar_hi[:SAMPLE_COUNT]
+                valid = hi_i > lo_i
+                rs.fft[valid] = [np.mean(fft_raw[l:min(h, len(fft_raw))]) for l, h in zip(lo_i[valid], hi_i[valid])]
+                single = (~valid) & (lo_i < len(fft_raw))
+                rs.fft[single] = fft_raw[lo_i[single]]
                 max_v = np.max(rs.fft)
                 if max_v > 1e-4:
                     rs.fft /= max_v
                 if BEAT_MODE == "flux":
-                    # spectral-flux beat detection (more robust than simple band ratio)
                     flux = float(np.sum(np.maximum(rs.fft - rs.prev_fft, 0.0)))
                     rs.prev_fft = rs.fft.copy()
                     rs.flux_history.append(flux)
@@ -240,7 +232,6 @@ class AudioDataProviderElement(Element):
                         rs.is_beat = False
                         rs.smooth_beat *= 0.88
                 else:
-                    # RMS-based beat detection (Avee-like): detect bursts over recent RMS
                     avg_rms = float(np.mean(rs.rms_history[:-1])) if len(rs.rms_history) > 6 else 0.0
                     if avg_rms > 1e-8 and rs.rms > max(1e-4, avg_rms * 1.5):
                         rs.is_beat = True
@@ -249,28 +240,25 @@ class AudioDataProviderElement(Element):
                         rs.is_beat = False
                         rs.smooth_beat *= 0.88
         else:
-            # Idle demo signal so the UI/effects are visible before loading a track.
             phase = rs.time * 2.0
             xs = np.linspace(0, 1, SAMPLE_COUNT)
             rs.fft = np.maximum(0.0, np.sin(xs * 9.0 + phase) * 0.25 + np.sin(xs * 31.0 - phase * 1.7) * 0.18)
 
-        # energy follows mean of fft (keeps visuals responsive)
         rs.energy = rs.energy * 0.82 + float(np.mean(rs.fft)) * 0.18
 
-        for i in range(SAMPLE_COUNT):
-            target = rs.fft[i]
-            if target > rs.smooth_bars[i]:
-                rs.smooth_bars[i] = rs.smooth_bars[i] * 0.18 + target * 0.82
-            else:
-                rs.smooth_bars[i] = max(0.0, rs.smooth_bars[i] - (2.4 + i / SAMPLE_COUNT) * rs.dt)
+        rise_a = 0.18
+        fall_rate = 2.4 + np.arange(SAMPLE_COUNT) / SAMPLE_COUNT
+        up = rs.fft > rs.smooth_bars
+        rs.smooth_bars[up] = rs.smooth_bars[up] * rise_a + rs.fft[up] * (1 - rise_a)
+        rs.smooth_bars[~up] = np.maximum(0.0, rs.smooth_bars[~up] - fall_rate[~up] * rs.dt)
 
-            if rs.smooth_bars[i] > rs.peak_bars[i]:
-                rs.peak_bars[i] = rs.smooth_bars[i]
-                rs.peak_timer[i] = 0.28
-            elif rs.peak_timer[i] > 0:
-                rs.peak_timer[i] -= rs.dt
-            else:
-                rs.peak_bars[i] = max(0.0, rs.peak_bars[i] - 1.0 * rs.dt)
+        jumped = rs.smooth_bars > rs.peak_bars
+        rs.peak_bars[jumped] = rs.smooth_bars[jumped]
+        old_timer = rs.peak_timer.copy()
+        rs.peak_timer[jumped] = 0.28
+        rs.peak_timer[~jumped] -= rs.dt
+        decay = (~jumped) & (old_timer <= 0)
+        rs.peak_bars[decay] = np.maximum(0.0, rs.peak_bars[decay] - 1.0 * rs.dt)
 
         if rs.is_beat:
             amt = 9.0 * rs.smooth_beat
@@ -281,42 +269,14 @@ class AudioDataProviderElement(Element):
         rs.rotation += 0.005 + rs.smooth_beat * 0.025
 
 
-class ImageElement(Element):
-    def render(self, surface, rs):
-        cx, cy = int(CENTER[0] + rs.shake[0]), int(CENTER[1] + rs.shake[1])
-        rad = int(min(WIDTH, HEIGHT) * 0.145) + int(rs.smooth_beat * 18)
-        glow_rad = rad + 24 + int(rs.energy * 55)
-        glow = pygame.Surface((glow_rad * 2, glow_rad * 2), pygame.SRCALPHA)
-        for r in range(glow_rad, 0, -8):
-            alpha = max(0, int(42 * (r / glow_rad) ** 2))
-            pygame.draw.circle(glow, (0, 210, 255, alpha), (glow_rad, glow_rad), r)
-        surface.blit(glow, (cx - glow_rad, cy - glow_rad), special_flags=pygame.BLEND_RGBA_ADD)
-
-        pygame.draw.circle(surface, (6, 7, 11, 180), (cx + 5, cy + 7), rad + 6)
-        if rs.original_cover:
-            sz = rad * 2
-            pg_img = pygame.transform.smoothscale(rs.original_cover, (sz, sz)).convert_alpha()
-            mask = pygame.Surface((sz, sz), pygame.SRCALPHA)
-            pygame.draw.circle(mask, (255, 255, 255, 255), (rad, rad), rad)
-            result = pygame.Surface((sz, sz), pygame.SRCALPHA)
-            result.blit(pg_img, (0, 0))
-            result.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-            surface.blit(result, (cx - rad, cy - rad))
-        else:
-            pygame.draw.circle(surface, (20, 22, 30), (cx, cy), rad)
-            pygame.draw.circle(surface, (0, 235, 255), (cx, cy), rad, 3)
-            note = get_font(64, True).render("♫", True, (230, 250, 255))
-            surface.blit(note, note.get_rect(center=(cx, cy - 4)))
-
-
 class LetterPathCache:
     def __init__(self):
         self.key = None
-        self.points = []
+        self.points = None   # (count, 2) float array
 
     def get_points(self, text, count):
         key = (text, count, WIDTH, HEIGHT)
-        if key == self.key and self.points:
+        if key == self.key and self.points is not None:
             return self.points
         font = get_font(186, True)
         mask_surf = font.render(text, True, (255, 255, 255))
@@ -327,282 +287,269 @@ class LetterPathCache:
             mask = pygame.mask.from_surface(canvas)
             outline_pts = mask.outline()
             if len(outline_pts) < 8:
-                self.points = []
-                return self.points
+                self.points = None
+                return None
             arr = np.array(outline_pts, dtype=float)
             arr[:, 0] -= canvas.get_width() / 2
             arr[:, 1] -= canvas.get_height() / 2
             scale = min(WIDTH * 0.62 / max(1, canvas.get_width()), HEIGHT * 0.36 / max(1, canvas.get_height()))
             arr *= scale
-            center = np.array([WIDTH / 2, HEIGHT / 2 + 10], dtype=float)
-            arr += center
-            # sample along the polygon by arc length for even distribution
+            arr += np.array([WIDTH / 2, HEIGHT / 2 + 10], dtype=float)
             deltas = np.diff(arr, axis=0, append=arr[:1])
             dists = np.hypot(deltas[:, 0], deltas[:, 1])
             cum = np.cumsum(dists)
             total = cum[-1]
             if total <= 0:
-                self.points = []
-                return self.points
+                self.points = None
+                return None
             positions = np.linspace(0, total, count, endpoint=False)
-            idxs = np.searchsorted(cum, positions)
-            pts = []
-            for p, i_idx in zip(positions, idxs):
-                prev_idx = (i_idx - 1) % len(arr)
-                seg_start = cum[prev_idx] if prev_idx >= 0 else 0.0
-                seg_len = dists[prev_idx]
-                if seg_len == 0:
-                    t = 0.0
-                else:
-                    t = (p - seg_start) / seg_len
-                a = arr[prev_idx]
-                b = arr[i_idx % len(arr)]
-                pt = a + (b - a) * t
-                pts.append((float(pt[0]), float(pt[1])))
+            idxs = np.clip(np.searchsorted(cum, positions), 1, len(arr) - 1)
+            prev_idx = idxs - 1
+            seg_len = dists[prev_idx]
+            t = np.where(seg_len > 0, (positions - cum[prev_idx]) / np.maximum(seg_len, 1e-9), 0.0)
+            pts = arr[prev_idx] + (arr[idxs] - arr[prev_idx]) * t[:, None]
             self.points = pts
             self.key = key
-            return self.points
+            return pts
         except Exception:
-            self.points = []
-            return self.points
+            self.points = None
+            return None
 
 
 class SegmentElement(Element):
+    """FFT bars along LETTER/CIRCLE/LINE paths -> one instanced-quad batch.
+    Instance layout (14 floats): center.xy | halfext.xy | dir.xy round alpha | rgba"""
+
     def __init__(self):
         super().__init__()
         self.letter_cache = LetterPathCache()
+        self.instances = np.zeros((SAMPLE_COUNT, 14), dtype=np.float32)
+        self.dots = np.zeros((SAMPLE_COUNT, 12), dtype=np.float32)
+        self.dot_count = 0
 
     def _letter_text(self):
         clean = "".join(ch for ch in title.upper() if ch.isalnum())
         return (clean[:5] or "AVEE")
 
-    def _path_sample(self, i, rs):
+    def build(self, rs: RenderState):
         mode = rs.path_mode
         cx, cy = CENTER[0] + rs.shake[0], CENTER[1] + rs.shake[1]
-        if mode == "LETTER":
-            pts = self.letter_cache.get_points(self._letter_text(), SAMPLE_COUNT)
-            if pts:
-                x, y = pts[i]
-                x += rs.shake[0]
-                y += rs.shake[1]
-                x2, y2 = pts[(i + 1) % SAMPLE_COUNT]
-                tx, ty = x2 - pts[i][0], y2 - pts[i][1]
-                ln = math.hypot(tx, ty) or 1.0
-                tx, ty = tx / ln, ty / ln
-                nx, ny = -ty, tx
-                if (x - cx) * nx + (y - cy) * ny < 0:
-                    nx, ny = -nx, -ny
-                return x, y, nx, ny, tx, ty
-        if mode == "LINE":
+        i = np.arange(SAMPLE_COUNT, dtype=float)
+        pts = self.letter_cache.get_points(self._letter_text(), SAMPLE_COUNT) if mode == "LETTER" else None
+        if mode == "LETTER" and pts is not None:
+            pos = pts + rs.shake
+            tang = np.roll(pts, -1, axis=0) - pts
+            ln = np.hypot(tang[:, 0], tang[:, 1])
+            ln[ln == 0] = 1.0
+            tang = tang / ln[:, None]
+            norm = np.stack([-tang[:, 1], tang[:, 0]], axis=1)
+            flip = ((pos[:, 0] - cx) * norm[:, 0] + (pos[:, 1] - cy) * norm[:, 1]) < 0
+            norm[flip] *= -1
+        elif mode == "LINE":
             span = WIDTH * 0.76
-            x = cx - span / 2 + span * (i / max(1, SAMPLE_COUNT - 1))
-            y = cy + math.sin((i / SAMPLE_COUNT) * math.pi * 4 + rs.time * 1.6) * (22 + 28 * rs.energy)
-            return x, y, 0.0, -1.0, 1.0, 0.0
-        base_r = min(WIDTH, HEIGHT) * 0.23 + (rs.smooth_beat * 24)
-        ang = (i / SAMPLE_COUNT) * 2 * math.pi + rs.rotation
-        return cx + math.cos(ang) * base_r, cy + math.sin(ang) * base_r, math.cos(ang), math.sin(ang), -math.sin(ang), math.cos(ang)
+            pos = np.empty((SAMPLE_COUNT, 2))
+            pos[:, 0] = cx - span / 2 + span * (i / max(1, SAMPLE_COUNT - 1))
+            pos[:, 1] = cy + np.sin((i / SAMPLE_COUNT) * TAU * 4 + rs.time * 1.6) * (22 + 28 * rs.energy)
+            norm = np.tile([0.0, -1.0], (SAMPLE_COUNT, 1))
+            tang = np.tile([1.0, 0.0], (SAMPLE_COUNT, 1))
+        else:
+            base_r = min(WIDTH, HEIGHT) * 0.23 + (rs.smooth_beat * 24)
+            ang = (i / SAMPLE_COUNT) * TAU + rs.rotation
+            pos = np.stack([cx + np.cos(ang) * base_r, cy + np.sin(ang) * base_r], axis=1)
+            norm = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+            tang = np.stack([-np.sin(ang), np.cos(ang)], axis=1)
 
-    def render(self, surface, rs):
-        max_h = min(WIDTH, HEIGHT) * (0.23 if rs.path_mode != "LETTER" else 0.15)
-        bar_w = 3.6 if rs.path_mode == "LETTER" else 5.2
-        for i in range(SAMPLE_COUNT):
-            v, p = float(rs.smooth_bars[i]), float(rs.peak_bars[i])
-            h = max(2.0, v * max_h)
-            x, y, nx, ny, tx, ty = self._path_sample(i, rs)
-            wobble = math.sin(rs.time * 4.5 + i * 0.17) * rs.smooth_beat * 7.0
-            x += nx * wobble
-            y += ny * wobble
-            x0, y0 = x + nx * h, y + ny * h
-            x1, y1 = x0 + tx * bar_w, y0 + ty * bar_w
-            x2, y2 = x + tx * bar_w, y + ty * bar_w
-            hue = i / SAMPLE_COUNT
-            col = (
-                int(90 + 90 * math.sin(hue * math.tau + rs.time) + 65 * v),
-                int(175 + 55 * math.sin(hue * math.tau + 2.2)),
-                255,
-                235,
-            )
-            pygame.draw.polygon(surface, col, [(x0, y0), (x1, y1), (x2, y2), (x, y)])
-            if p > 0.05:
-                px, py = x + nx * (p * max_h + 9), y + ny * (p * max_h + 9)
-                pygame.draw.circle(surface, (255, 255, 255, 210), (int(px), int(py)), 2)
+        max_h = min(WIDTH, HEIGHT) * (0.23 if mode != "LETTER" else 0.15)
+        bar_w = 3.6 if mode == "LETTER" else 5.2
+        v = rs.smooth_bars
+        h = np.maximum(2.0, v * max_h)
+        wobble = np.sin(rs.time * 4.5 + i * 0.17) * rs.smooth_beat * 7.0
+        base = pos + norm * wobble[:, None]
+        tip = base + norm * h[:, None]
 
+        ins = self.instances
+        ins[:, 0:2] = (base + tip) / 2.0                     # quad center (pixels)
+        ins[:, 2] = h / 2.0                                  # local-x half extent (long axis)
+        ins[:, 3] = bar_w / 2.0                              # local-y half extent
+        ins[:, 4], ins[:, 5] = norm[:, 0], norm[:, 1]        # rotation: long axis = normal
+        ins[:, 6] = 0.0                                      # sharp rect
+        ins[:, 7] = 0.92                                     # alpha
+        hue = i / SAMPLE_COUNT
+        ins[:, 8] = np.clip((90 + 90 * np.sin(hue * TAU + rs.time) + 65 * v) / 255.0, 0, 1)
+        ins[:, 9] = (175 + 55 * np.sin(hue * TAU + 2.2)) / 255.0
+        ins[:, 10] = 1.0
+        ins[:, 11] = 235 / 255.0
 
-class TextElement(Element):
-    def render(self, surface, rs):
-        if show_ui:
-            return
-        t_font, a_font = get_font(30, True), get_font(18, False)
-        t_surf = t_font.render(title[:34], True, (255, 255, 255))
-        a_surf = a_font.render(f"{artist[:40]}  •  {rs.path_mode} path  •  H hides UI", True, (125, 220, 255))
-        surface.blit(t_surf, (46, HEIGHT - 112))
-        surface.blit(a_surf, (48, HEIGHT - 74))
-
-
-class Particle:
-    __slots__ = ["x", "y", "vx", "vy", "life", "max", "size"]
-
-    def __init__(self, x, y, vx, vy, life, size):
-        self.x, self.y, self.vx, self.vy, self.life, self.max, self.size = x, y, vx, vy, life, life, size
+        p = rs.peak_bars
+        show = p > 0.05
+        n = int(np.count_nonzero(show))
+        self.dot_count = n
+        if n:
+            dctr = pos[show] + norm[show] * (p[show] * max_h + 9)[:, None]
+            d = self.dots[:n]
+            d[:, 0:2] = dctr
+            d[:, 2] = 2.0
+            d[:, 3] = 2.0
+            d[:, 4], d[:, 5] = 1.0, 0.0
+            d[:, 6] = 1.0                       # circle SDF
+            d[:, 7] = 0.82
+            d[:, 8:11] = 1.0
+            d[:, 11] = 210 / 255.0
+        return ins
 
 
 class ParticlesElement(Element):
+    """Beat-spawned particles -> one instanced-circle draw call (SoA arrays)."""
+    MAX_PARTICLES = 1024
+
     def __init__(self):
         super().__init__()
-        self.particles = []
+        n = self.MAX_PARTICLES
+        f32 = np.float32
+        self.x = np.zeros(n, f32); self.y = np.zeros(n, f32)
+        self.vx = np.zeros(n, f32); self.vy = np.zeros(n, f32)
+        self.life = np.zeros(n, f32); self.maxlife = np.ones(n, f32)
+        self.size = np.zeros(n, f32)
+        self.count = 0
+        self.instances = np.zeros((n, 12), dtype=f32)
 
     def update(self, rs):
+        dt = rs.dt
+        c = self.count
+        if c:
+            sl = slice(0, c)
+            self.x[sl] += self.vx[sl] * dt
+            self.y[sl] += self.vy[sl] * dt
+            self.vx[sl] *= 0.992
+            self.vy[sl] *= 0.992
+            self.life[sl] -= dt
+            alive = self.life[:c] > 0
+            if not alive.all():
+                for a in (self.x, self.y, self.vx, self.vy, self.life, self.maxlife, self.size):
+                    a[:c] = np.concatenate([a[:c][alive], a[c:]])
+                self.count = c = int(alive.sum())
         if rs.is_beat and rs.smooth_beat > 0.35:
-            cx, cy = CENTER[0] + rs.shake[0], CENTER[1] + rs.shake[1]
-            for _ in range(int(5 + rs.smooth_beat * 18)):
-                a = random.uniform(0, math.tau)
-                s = random.uniform(70, 260) * (0.4 + rs.smooth_beat)
-                self.particles.append(Particle(cx, cy, math.cos(a) * s, math.sin(a) * s, random.uniform(0.7, 2.4), random.uniform(1.5, 4.5)))
-        for p in self.particles[:]:
-            p.x += p.vx * rs.dt
-            p.y += p.vy * rs.dt
-            p.vx *= 0.992
-            p.vy *= 0.992
-            p.life -= rs.dt
-            if p.life <= 0:
-                self.particles.remove(p)
+            spawn = min(int(5 + rs.smooth_beat * 18), self.MAX_PARTICLES - c)
+            if spawn > 0:
+                cx, cy = CENTER[0] + rs.shake[0], CENTER[1] + rs.shake[1]
+                a = np.random.uniform(0, TAU, spawn)
+                s = np.random.uniform(70, 260, spawn) * (0.4 + rs.smooth_beat)
+                sl = slice(c, c + spawn)
+                self.x[sl] = cx; self.y[sl] = cy
+                self.vx[sl] = np.cos(a) * s
+                self.vy[sl] = np.sin(a) * s
+                life = np.random.uniform(0.7, 2.4, spawn)
+                self.life[sl] = life; self.maxlife[sl] = life
+                self.size[sl] = np.random.uniform(1.5, 4.5, spawn)
+                self.count = c + spawn
 
-    def render(self, surface, rs):
-        for p in self.particles:
-            alpha = int(210 * (p.life / p.max))
-            pygame.draw.circle(surface, (90, 220, 255, alpha), (int(p.x), int(p.y)), max(1, int(p.size * (p.life / p.max))))
-
-
-class GlowEffectElement(Element):
-    def render(self, surface, rs):
-        scale = 0.34
-        tiny = pygame.transform.smoothscale(surface, (max(1, int(WIDTH * scale)), max(1, int(HEIGHT * scale))))
-        glow = pygame.transform.smoothscale(tiny, (WIDTH, HEIGHT))
-        glow.set_alpha(int(70 + 90 * rs.smooth_beat))
-        surface.blit(glow, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
-
-
-class RgbSplitEffectElement(Element):
-    def render(self, surface, rs):
-        amt = int(2 + 18 * rs.smooth_beat + 7 * rs.energy)
-        if amt <= 0:
-            return
-        red, green, blue = surface.copy(), surface.copy(), surface.copy()
-        red.fill((255, 0, 0, 255), special_flags=pygame.BLEND_RGBA_MULT)
-        green.fill((0, 255, 0, 255), special_flags=pygame.BLEND_RGBA_MULT)
-        blue.fill((0, 0, 255, 255), special_flags=pygame.BLEND_RGBA_MULT)
-        surface.fill((0, 0, 0, 0))
-        # Avee-style RGB slit: three colored taps in different directions, no shader required.
-        surface.blit(green, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
-        surface.blit(red, (-amt, int(-amt * 0.22)), special_flags=pygame.BLEND_RGBA_ADD)
-        surface.blit(blue, (amt, int(amt * 0.22)), special_flags=pygame.BLEND_RGBA_ADD)
+    def build(self, rs):
+        n = self.count
+        if n == 0:
+            return None, 0
+        frac = self.life[:n] / self.maxlife[:n]
+        ins = self.instances[:n]
+        ins[:, 0] = self.x[:n]
+        ins[:, 1] = self.y[:n]
+        r = np.maximum(1.0, self.size[:n] * frac)
+        ins[:, 2] = r
+        ins[:, 3] = r
+        ins[:, 4] = 1.0
+        ins[:, 5] = 0.0
+        ins[:, 6] = 1.0                       # circle
+        ins[:, 7] = 0.82 * frac
+        ins[:, 8], ins[:, 9], ins[:, 10] = 0.35, 0.86, 1.0
+        ins[:, 11] = 1.0
+        return ins, n
 
 
-class MotionBlurEffectElement(Element):
+class ImageElement(Element):
+    """Cover disc + halo are fully procedural in IMAGE_FS; this element only
+    keeps the GL texture in sync with the loaded artwork."""
+
     def __init__(self):
         super().__init__()
-        self.history = []
+        self.uploaded_id = None
 
-    def render(self, surface, rs):
-        # store a smaller copy to reduce memory/copy bandwidth
-        scale = 0.46
-        sw, sh = max(1, int(WIDTH * scale)), max(1, int(HEIGHT * scale))
-        tiny = pygame.transform.smoothscale(surface, (sw, sh))
-        self.history.append(tiny)
-        if len(self.history) > 6:
-            self.history.pop(0)
-        for idx, frame in enumerate(reversed(self.history[:-1])):
-            alpha = max(14, int((92 - idx * 15) * (1.0 - rs.smooth_beat * 0.35)))
-            frame_up = pygame.transform.smoothscale(frame, (WIDTH, HEIGHT))
-            frame_up.set_alpha(alpha)
-            off = idx + 1
-            dx = int(-rs.shake[0] * 0.18 * off)
-            dy = int(-rs.shake[1] * 0.18 * off)
-            surface.blit(frame_up, (dx, dy), special_flags=pygame.BLEND_RGBA_ADD)
+    def sync_texture(self, rs, renderer):
+        cov = id(rs.original_cover)
+        if cov != self.uploaded_id:
+            self.uploaded_id = cov
+            renderer.upload_cover(rs.original_cover, rs.cover_size)
 
 
-class MirrorEffectElement(Element):
-    def render(self, surface, rs):
-        half = surface.subsurface((0, 0, WIDTH // 2, HEIGHT)).copy()
-        flipped = pygame.transform.flip(half, True, False)
-        surface.blit(flipped, (WIDTH // 2, 0))
+# -------------------------------------------------------------------------
+# EFFECT TOGGLES — these no longer copy surfaces on the CPU; each one just
+# drives an amount uniform inside the GPU composite shader.
+# Slots match u_amounts[] in gl_shaders.COMPOSITE_FS.
+# -------------------------------------------------------------------------
+class EffectToggle:
+    def __init__(self, slot, enabled=False):
+        self.enabled = enabled
+        self.slot = slot
 
 
-class BlurEffectElement(Element):
-    def render(self, surface, rs):
-        scale = max(0.16, 0.46 - (rs.smooth_beat * 0.22))
-        sw, sh = max(1, int(WIDTH * scale)), max(1, int(HEIGHT * scale))
-        tiny = pygame.transform.smoothscale(surface, (sw, sh))
-        blurred = pygame.transform.smoothscale(tiny, (WIDTH, HEIGHT))
-        blurred.set_alpha(105)
-        surface.blit(blurred, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
-
-
-class ColorCorrectionElement(Element):
-    def render(self, surface, rs):
-        tint = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        tint.fill((0, 24 + int(38 * rs.smooth_beat), 58, 36))
-        surface.blit(tint, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
-        contrast = pygame.Surface((WIDTH, HEIGHT))
-        val = int(132 + 44 * rs.smooth_beat)
-        contrast.fill((val, val, val))
-        surface.blit(contrast, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
+PPE_GLOW = EffectToggle(0)
+PPE_BLUR = EffectToggle(1)
+PPE_MBlur = EffectToggle(2)
+PPE_Color = EffectToggle(3)
+PPE_Mirror = EffectToggle(4)
+PPE_RGB = EffectToggle(5)
+EFFECTS = {"toggle_glow": PPE_GLOW, "toggle_blur": PPE_BLUR, "toggle_mblur": PPE_MBlur,
+           "toggle_color": PPE_Color, "toggle_mirror": PPE_Mirror, "toggle_rgb": PPE_RGB}
 
 
 # -------------------------------------------------------------------------
 # SCENE BUILDER
 # -------------------------------------------------------------------------
-Root = Composition()
 CompAudio = AudioDataProviderElement()
 CompParts = ParticlesElement()
 CompBars = SegmentElement()
 CompImage = ImageElement()
-CompText = TextElement()
-PPE_Glow = GlowEffectElement()
-PPE_RGB = RgbSplitEffectElement()
-PPE_MBlur = MotionBlurEffectElement()
-PPE_Mirror = MirrorEffectElement()
-PPE_Blur = BlurEffectElement()
-PPE_Color = ColorCorrectionElement()
+CompTextEnabled = True     # TEXT button toggles the title/artist overlay
 
-PPE_RGB.enabled = False
-PPE_MBlur.enabled = False
-PPE_Glow.enabled = False
-PPE_Mirror.enabled = False
-PPE_Blur.enabled = False
-PPE_Color.enabled = False
 
-for element in (CompAudio, CompParts, CompBars, CompImage, CompText, PPE_Glow, PPE_Blur, PPE_MBlur, PPE_Mirror, PPE_Color, PPE_RGB):
-    Root.add(element)
+def scene_update(rs):
+    CompAudio.update(rs)
+    if CompParts.enabled:
+        CompParts.update(rs)
 
 
 # -------------------------------------------------------------------------
 # ASSET HELPERS
 # -------------------------------------------------------------------------
 def extract_cover(file):
+    """Return (rgba_bytes, (w, h)) ready for a direct GL texture upload."""
     try:
         ext = os.path.splitext(file)[1].lower()
+        raw = None
         if ext == ".mp3":
             tags = ID3(file)
             for tag in tags.values():
                 if isinstance(tag, APIC):
-                    return pygame.image.load(io.BytesIO(tag.data)).convert()
+                    raw = tag.data
+                    break
         elif ext == ".flac":
             audio = FLAC(file)
             if audio.pictures:
-                return pygame.image.load(io.BytesIO(audio.pictures[0].data)).convert()
+                raw = audio.pictures[0].data
         elif ext in (".m4a", ".mp4", ".aac"):
             audio = MP4(file)
             if "covr" in audio:
-                return pygame.image.load(io.BytesIO(bytes(audio["covr"][0]))).convert()
+                raw = bytes(audio["covr"][0])
+        if raw is None:
+            return None, None
+        img = pygame.image.load(io.BytesIO(raw)).convert_alpha()
+        side = 512
+        img = pygame.transform.smoothscale(img, (side, side))
+        return pygame.image.tostring(img, "RGBA", False), (side, side)
     except Exception:
-        pass
-    return None
+        return None, None
 
 
 def reload_audio(file):
     global data, samplerate, sound, title, artist, RS
-    global play_pos_ms
+    global play_channel, play_start_monotonic, play_pos_ms
     try:
         data, samplerate = sf.read(file)
         if len(data.shape) > 1:
@@ -611,11 +558,8 @@ def reload_audio(file):
         pygame.mixer.init(samplerate, -16, 2, 2048)
         sound = pygame.mixer.Sound(file)
         sound.set_volume(volume)
-        # Keep reference to the Channel so we can query playback position
         ch = sound.play()
-        global play_channel
         play_channel = ch
-        global play_start_monotonic
         play_start_monotonic = time.monotonic()
         with play_pos_lock:
             play_pos_ms = 0
@@ -624,7 +568,6 @@ def reload_audio(file):
                 ch.set_volume(volume)
             except Exception:
                 pass
-            # start background poller to cache playback position
             try:
                 t = threading.Thread(target=_poll_play_pos, args=(ch,), daemon=True)
                 t.start()
@@ -633,120 +576,364 @@ def reload_audio(file):
         title = os.path.splitext(os.path.basename(file))[0]
         artist = "Loaded track"
         RS.time = 0.0
-        RS.original_cover = extract_cover(file)
+        RS.original_cover, RS.cover_size = extract_cover(file)
         _precompute_bar_bins(samplerate)
-        for k in beat_energy_history:
-            beat_energy_history[k].clear()
     except Exception as e:
         print(f"File load error: {e}")
 
 
 # -------------------------------------------------------------------------
-# UI DRAWING
+# GPU RENDERER (moderngl / OpenGL 3.3 core)
+# Frame graph per tick:
+#   scene FBO   : grid shader + cover shader + instanced bars/dots/particles
+#   comp FBO    : one fullscreen composite pass (glow/blur/motion blur/
+#                 mirror/color correction/RGB split/vignette) reading a ring
+#                 of half-res history textures for the motion blur
+#   framebuffer : blit(comp) then alpha-blend the UI overlay texture
 # -------------------------------------------------------------------------
-def draw_grid_background(screen, rs):
-    screen.fill((4, 5, 10))
-    horizon = int(HEIGHT * 0.58 + math.sin(rs.time * 0.7) * 12)
-    for y in range(horizon, HEIGHT, 34):
-        alpha = max(18, min(88, int((y - horizon) / max(1, HEIGHT - horizon) * 92)))
-        pygame.draw.line(screen, (0, 120, 180, alpha), (0, y), (WIDTH, y), 1)
-    for x in range(-WIDTH, WIDTH * 2, 54):
-        skew = int(math.sin(rs.time * 0.25) * 22)
-        pygame.draw.line(screen, (0, 62, 96), (WIDTH // 2, horizon), (x + skew, HEIGHT), 1)
+class GlRenderer:
+    CORNERS = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype=np.float32)
+    HIST_LEN = 8
+
+    def __init__(self, ctx, w, h):
+        self.ctx = ctx
+        self.w, self.h = w, h
+        ctx.enable(moderngl.BLEND)
+        ctx.disable(moderngl.DEPTH_TEST)
+        self.quad_vbo = ctx.buffer(self.CORNERS.tobytes())
+        self._build_programs()
+        self._build_fbos(w, h)
+
+        # bars: 14 floats per instance
+        self.inst_data = ctx.buffer(b" " * (SAMPLE_COUNT * 56), reserve=True)
+        self.inst_vao = ctx.vertex_array(
+            self.prog_inst,
+            [(self.quad_vbo, "2f / 14f", "in_corner"),
+             (self.inst_data, "4f 4f 4f / 0f", "in_center_wh", "in_dir_half", "in_color")],
+        )
+        # dots + particles share a 12-float layout
+        self.dot_data = ctx.buffer(b" " * (SAMPLE_COUNT * 48), reserve=True)
+        self.dot_vao = ctx.vertex_array(
+            self.prog_inst,
+            [(self.quad_vbo, "2f / 12f", "in_corner"),
+             (self.dot_data, "4f 4f 4f / 0f", "in_center_wh", "in_dir_half", "in_color")],
+        )
+        self.part_data = ctx.buffer(b" " * (CompParts.MAX_PARTICLES * 48), reserve=True)
+        self.part_vao = ctx.vertex_array(
+            self.prog_inst,
+            [(self.quad_vbo, "2f / 12f", "in_corner"),
+             (self.part_data, "4f 4f 4f / 0f", "in_center_wh", "in_dir_half", "in_color")],
+        )
+
+        self.cover_tex = None
+        self.ui_tex = None
+        self.ui_dirty = True
+        self._hist_write = 0
+        self.prog_comp["u_scene"] = 0
+        for k, name in enumerate(("u_h0", "u_h1", "u_h2", "u_h3", "u_h4", "u_h5", "u_h6", "u_h7")):
+            self.prog_comp[name] = k + 1
+        self.prog_blit["u_tex"] = 0
+
+    def _build_programs(self):
+        c = self.ctx
+        self.prog_grid = c.program(vertex_shader=SH.VERTEX_QUAD, fragment_shader=SH.GRID_FS)
+        self.prog_inst = c.program(vertex_shader=SH.INSTANCED_VS, fragment_shader=SH.INSTANCED_FS)
+        self.prog_image = c.program(vertex_shader=SH.VERTEX_QUAD, fragment_shader=SH.IMAGE_FS)
+        self.prog_comp = c.program(vertex_shader=SH.VERTEX_QUAD, fragment_shader=SH.COMPOSITE_FS)
+        self.prog_blit = c.program(vertex_shader=SH.VERTEX_QUAD, fragment_shader=SH.BLIT_FS)
+        self.quad_full = c.simple_vertex_array(self.prog_grid, self.quad_vbo, "in_pos")
+
+    def _new_fbo(self, w, h):
+        tex = self.ctx.texture((w, h), 4, dtype="f1")
+        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        return self.ctx.framebuffer(color_attachments=[tex])
+
+    def _build_fbos(self, w, h):
+        self.scene = self._new_fbo(w, h)
+        self.comp_cur = self._new_fbo(w, h)
+        self.hist_fbos = [self._new_fbo(max(2, w // 2), max(2, h // 2)) for _ in range(self.HIST_LEN)]
+        self.hist_tex = [fb.color_attachments[0] for fb in self.hist_fbos]
+
+    def release_fbos(self):
+        for fb in [self.scene, self.comp_cur] + self.hist_fbos:
+            fb.release()
+
+    def resize(self, w, h):
+        if (w, h) == (self.w, self.h):
+            return
+        self.release_fbos()
+        self._build_fbos(w, h)
+        self.w, self.h = w, h
+        self.ui_dirty = True
+
+    def upload_cover(self, buf, size):
+        if self.cover_tex:
+            self.cover_tex.release()
+            self.cover_tex = None
+        if buf and size:
+            self.cover_tex = self.ctx.texture(size, 4, data=buf)
+            self.cover_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+    def set_ui_surface(self, surf):
+        """Upload a pygame RGBA surface as the UI overlay texture."""
+        w, h = surf.get_size()
+        raw = pygame.image.tostring(surf, "RGBA", False)
+        if self.ui_tex is None or self.ui_tex.size != (w, h):
+            if self.ui_tex:
+                self.ui_tex.release()
+            self.ui_tex = self.ctx.texture((w, h), 4, data=raw)
+            self.ui_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        else:
+            self.ui_tex.write(raw)
+        self.ui_dirty = False
+
+    def _quad(self, prog):
+        return self.ctx.simple_vertex_array(prog, self.quad_vbo, "in_pos")
+
+    def render_scene(self, rs):
+        c = self.ctx
+        self.scene.use()
+        c.set_blend_func(moderngl.ONE, moderngl.ZERO)
+        c.clear(0, 0, 0, 1)
+
+        # background perspective grid — pure fragment shader
+        self.prog_grid["u_time"].value = float(rs.time)
+        self.prog_grid["u_aspect"].value = self.h / self.w
+        self.quad_full.render()
+
+        c.set_blend_func(moderngl.ONE, moderngl.ONE)  # premultiplied additive
+
+        # cover disc + pulsing halo — procedural fragment shader
+        if CompImage.enabled:
+            CompImage.sync_texture(rs, self)
+            cx, cy = CENTER[0] + rs.shake[0], CENTER[1] + rs.shake[1]
+            rad = min(self.w, self.h) * 0.145 + rs.smooth_beat * 18
+            p = self.prog_image
+            p["u_tex"].value = 0
+            p["u_hasTex"].value = 1 if self.cover_tex else 0
+            p["u_size"].value = (self.w, self.h)
+            p["u_center"].value = (float(cx), float(cy))
+            p["u_half"].value = (float(rad), float(rad))
+            p["u_beat"].value = float(rs.smooth_beat)
+            p["u_energy"].value = float(rs.energy)
+            if self.cover_tex:
+                self.cover_tex.use(0)
+            vao = self._quad(p)
+            vao.render()
+            vao.release()
+
+        # FFT bars — one instanced draw call
+        if CompBars.enabled:
+            ins = CompBars.build(rs)
+            self.inst_data.write(np.ascontiguousarray(ins).tobytes())
+            self.prog_inst["u_size"].value = (self.w, self.h)
+            self.inst_vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=SAMPLE_COUNT)
+
+            # peak dots — instanced circles
+            n = CompBars.dot_count
+            if n:
+                self.dot_data.write(CompBars.dots[:n].tobytes())
+                self.dot_vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
+
+        # particles — instanced circles
+        if CompParts.enabled:
+            arr, n = CompParts.build(rs)
+            if n:
+                self.part_data.write(np.ascontiguousarray(arr).tobytes())
+                self.part_vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
+
+    def composite(self, rs):
+        c = self.ctx
+        self.comp_cur.use()
+        c.set_blend_func(moderngl.ONE, moderngl.ZERO)
+        p = self.prog_comp
+        self.scene.color_attachments[0].use(0)
+        p["u_size"].value = (self.w, self.h)
+        p["u_time"].value = float(rs.time)
+        p["u_beat"].value = float(rs.smooth_beat)
+        p["u_energy"].value = float(rs.energy)
+        p["u_shakeX"].value = float(rs.shake[0])
+        p["u_shakeY"].value = float(rs.shake[1])
+        amounts = [0.0] * 6
+        for eff in EFFECTS.values():
+            amounts[eff.slot] = 1.0 if eff.enabled else 0.0
+        p["u_amounts"].value = amounts
+        # RGB-split offset in normalized uv units (CPU version used 2..27 px)
+        p["u_rgbAmt"].value = (2.0 + 18.0 * rs.smooth_beat + 7.0 * rs.energy) / self.w
+
+        if PPE_MBlur.enabled:
+            for k in range(self.HIST_LEN):
+                idx = (self._hist_write - 1 - k) % self.HIST_LEN
+                self.hist_tex[idx].use(k + 1)
+        else:
+            self.hist_tex[0].use_range(1, self.HIST_LEN)
+        vao = self._quad(p)
+        vao.render()
+        vao.release()
+
+        # record frame into the history ring (GPU-side downsampled blit)
+        slot = self._hist_write % self.HIST_LEN
+        self._hist_write += 1
+        self.hist_fbos[slot].use()
+        pb = self.prog_blit
+        self.comp_cur.color_attachments[0].use(0)
+        vao = self._quad(pb)
+        vao.render()
+        vao.release()
+
+    def present(self):
+        c = self.ctx
+        c.reset_viewport()
+        c.set_blend_func(moderngl.ONE, moderngl.ZERO)
+        c.clear(0, 0, 0, 1)
+        pb = self.prog_blit
+        self.comp_cur.color_attachments[0].use(0)
+        vao = self._quad(pb)
+        vao.render()
+        vao.release()
+        if show_ui and self.ui_tex:
+            c.set_blend_func(moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+            self.ui_tex.use(0)
+            vao = self._quad(pb)
+            vao.render()
+            vao.release()
 
 
-def draw_ui(screen, clock, btn_states):
+RENDERER = None
+
+
+# -------------------------------------------------------------------------
+# UI DRAWING — rendered by pygame into an offscreen surface at most ~10x/sec
+# and uploaded as a GL texture; the GPU blends it over the composited scene.
+# -------------------------------------------------------------------------
+def build_ui_surface(clock, btn_states, fps_text):
+    surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
     panel = pygame.Surface((PANEL_RECT.width, PANEL_RECT.height), pygame.SRCALPHA)
     panel.fill((6, 9, 18, 218))
     pygame.draw.rect(panel, (0, 210, 255, 75), panel.get_rect(), 1, border_radius=18)
-    screen.blit(panel, PANEL_RECT.topleft)
+    surf.blit(panel, PANEL_RECT.topleft)
 
-    header = get_font(21, True).render("AVEE PLAYER PY • CPU/PYGAME VISUALIZER", True, (240, 252, 255))
-    screen.blit(header, (24, PANEL_RECT.y + 16))
-    subtitle = get_font(13).render("Letter path bars, motion blur, RGB slit, glow, mirror, color correction — no shaders/OpenGL/Vulkan", True, (120, 205, 230))
-    screen.blit(subtitle, (24, PANEL_RECT.y + 40))
+    header = get_font(21, True).render("AVEE PLAYER PY \u2022 GPU/OPENGL SHADER VISUALIZER", True, (240, 252, 255))
+    surf.blit(header, (24, PANEL_RECT.y + 16))
+    subtitle = get_font(13).render(
+        "Instanced quads + FBO post FX on the GPU: glow/blur/motion blur/mirror/rgb split via GLSL",
+        True, (120, 205, 230))
+    surf.blit(subtitle, (24, PANEL_RECT.y + 40))
 
     labels = {
         "open": "OPEN", "path_mode": f"PATH {RS.path_mode}", "toggle_bars": "BARS", "toggle_image": "IMAGE",
-        "toggle_part": "PARTICLES", "toggle_text": "TEXT", "toggle_rgb": "RGB SLIT", "toggle_mblur": "MOTION BLUR",
+        "toggle_part": "PARTICLES", "toggle_text": "TEXT", "toggle_rgb": "RGB SPLIT", "toggle_mblur": "MOTION BLUR",
         "toggle_blur": "SOFT BLUR", "toggle_mirror": "MIRROR", "toggle_color": "COLOR", "toggle_glow": "GLOW",
     }
     for name, rect in BUTTON_RECTS.items():
         if name == "open" or name == "path_mode":
             active = True
+        elif name == "toggle_image":
+            active = CompImage.enabled
+        elif name == "toggle_text":
+            active = CompTextEnabled
         else:
             active = btn_states[name].enabled
         bg_col = (0, 150, 170) if active else (30, 34, 48)
         hi_col = (55, 240, 255) if active else (82, 88, 108)
-        pygame.draw.rect(screen, bg_col, rect, border_radius=8)
-        pygame.draw.rect(screen, hi_col, rect, 1, border_radius=8)
+        pygame.draw.rect(surf, bg_col, rect, border_radius=8)
+        pygame.draw.rect(surf, hi_col, rect, 1, border_radius=8)
         txt = get_font(11, True).render(labels[name], True, (245, 252, 255) if active else (176, 184, 198))
-        screen.blit(txt, txt.get_rect(center=rect.center))
+        surf.blit(txt, txt.get_rect(center=rect.center))
 
-    pygame.draw.rect(screen, (38, 44, 58), SLIDER_RECT, border_radius=5)
+    pygame.draw.rect(surf, (38, 44, 58), SLIDER_RECT, border_radius=5)
     fill_w = int(volume * SLIDER_RECT.width)
     if fill_w > 0:
-        pygame.draw.rect(screen, (0, 210, 255), (SLIDER_RECT.x, SLIDER_RECT.y, fill_w, SLIDER_RECT.height), border_radius=5)
+        pygame.draw.rect(surf, (0, 210, 255), (SLIDER_RECT.x, SLIDER_RECT.y, fill_w, SLIDER_RECT.height), border_radius=5)
     vol_label = get_font(13, True).render(f"VOLUME {int(volume * 100)}%", True, (220, 245, 255))
-    screen.blit(vol_label, (SLIDER_RECT.x, SLIDER_RECT.y - 24))
-    fps = get_font(13).render(f"{clock.get_fps():05.1f} FPS  •  H hide UI", True, (145, 180, 195))
-    screen.blit(fps, (SLIDER_RECT.x, SLIDER_RECT.y + 20))
+    surf.blit(vol_label, (SLIDER_RECT.x, SLIDER_RECT.y - 24))
+    fps = get_font(13).render(fps_text, True, (145, 180, 195))
+    surf.blit(fps, (SLIDER_RECT.x, SLIDER_RECT.y + 20))
+
+    if CompTextEnabled:
+        t_font, a_font = get_font(30, True), get_font(18, False)
+        t_surf = t_font.render(title[:34], True, (255, 255, 255))
+        a_surf = a_font.render(f"{artist[:40]}  \u2022  {RS.path_mode} path  \u2022  H hides UI", True, (125, 220, 255))
+        surf.blit(t_surf, (46, HEIGHT - 112))
+        surf.blit(a_surf, (48, HEIGHT - 74))
+    return surf
 
 
 # -------------------------------------------------------------------------
 # MAIN LOOP
 # -------------------------------------------------------------------------
+def _create_gl_context():
+    """Create the OpenGL context through pygame/SDL; fall back to a moderngl
+    standalone (offscreen) context when no display is available so the app
+    still runs headless."""
+    try:
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+        pygame.display.set_mode((WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
+        return moderngl.create_context(), False
+    except Exception as e:
+        print(f"[gpu] windowed GL unavailable ({e}); standalone offscreen context")
+        return moderngl.create_standalone_context(), True
+
+
 def main():
     global volume, show_ui, WIDTH, HEIGHT, CENTER, BUTTON_RECTS, SLIDER_RECT, PANEL_RECT
+    global RENDERER
     pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
-    pygame.display.set_caption("Avee Player - Pure Pygame Render Tree")
+    try:
+        pygame.mixer.init(-16, 2, 2048)
+    except Exception:
+        pass
+    ctx, offscreen = _create_gl_context()
+    print(f"[gpu] {ctx.info['GL_VERSION'].strip()} \u2014 {ctx.info['GL_RENDERER'].strip()}")
+    pygame.display.set_caption("Avee Player - GPU Shader Visualizer (OpenGL)")
     clock = pygame.time.Clock()
     _precompute_bar_bins(44100)
+    RENDERER = GlRenderer(ctx, WIDTH, HEIGHT)
 
     btn_states = {
         "toggle_bars": CompBars,
         "toggle_image": CompImage,
         "toggle_part": CompParts,
-        "toggle_text": CompText,
-        "toggle_rgb": PPE_RGB,
-        "toggle_blur": PPE_Blur,
-        "toggle_mblur": PPE_MBlur,
-        "toggle_mirror": PPE_Mirror,
-        "toggle_color": PPE_Color,
-        "toggle_glow": PPE_Glow,
+        **EFFECTS,
     }
 
     running = True
+    ui_timer = 0.0
     while running:
         RS.dt = min(0.05, clock.tick(60) / 1000.0)
-        Root.update(RS)
-        draw_grid_background(screen, RS)
-        layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        Root.render(layer, RS)
-        screen.blit(layer, (0, 0))
-        if show_ui:
-            draw_ui(screen, clock, btn_states)
+        scene_update(RS)
+        RENDERER.render_scene(RS)
+        RENDERER.composite(RS)
+
+        # refresh the UI overlay texture ~10x/sec (or immediately when dirty)
+        ui_timer -= RS.dt
+        if show_ui and (ui_timer <= 0.0 or RENDERER.ui_dirty):
+            ui_timer = 0.1
+            RENDERER.set_ui_surface(build_ui_surface(
+                clock, btn_states, f"{clock.get_fps():05.1f} FPS  \u2022  GPU ON  \u2022  H hide UI"))
+        RENDERER.present()
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.VIDEORESIZE:
+            elif event.type == pygame.VIDEORESIZE and not offscreen:
                 WIDTH, HEIGHT = max(720, event.w), max(560, event.h)
                 CENTER = np.array([WIDTH // 2, HEIGHT // 2], dtype=float)
                 BUTTON_RECTS, SLIDER_RECT, PANEL_RECT = get_button_rects(WIDTH, HEIGHT)
-                screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+                RENDERER.resize(WIDTH, HEIGHT)
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_h:
                     show_ui = not show_ui
+                    RENDERER.ui_dirty = True
                 elif event.key == pygame.K_TAB:
                     RS.path_mode_index = (RS.path_mode_index + 1) % len(PATH_MODES)
+                    RENDERER.ui_dirty = True
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and show_ui:
                 pos = event.pos
                 if SLIDER_RECT.collidepoint(pos):
                     volume = max(0.0, min(1.0, (pos[0] - SLIDER_RECT.x) / SLIDER_RECT.width))
-                    # set volume on playing channel when available; Sound.set_volume
-                    # affects future playbacks only, Channel.set_volume updates current playback
                     if play_channel:
                         try:
                             play_channel.set_volume(volume)
@@ -754,6 +941,7 @@ def main():
                             pass
                     elif sound:
                         sound.set_volume(volume)
+                    RENDERER.ui_dirty = True
                 for name, rect in BUTTON_RECTS.items():
                     if rect.collidepoint(pos):
                         if name == "open":
@@ -765,8 +953,21 @@ def main():
                                 reload_audio(f)
                         elif name == "path_mode":
                             RS.path_mode_index = (RS.path_mode_index + 1) % len(PATH_MODES)
+                        elif name == "toggle_text":
+                            CompTextEnabled = not CompTextEnabled
                         elif name in btn_states:
                             btn_states[name].enabled = not btn_states[name].enabled
+                        RENDERER.ui_dirty = True
+
+        if offscreen:
+            # headless smoke test: save one composited frame and exit
+            raw = ctx.framebuffer(color_attachments=[ctx.texture((WIDTH, HEIGHT), 4)])
+            ctx.copy_framebuffer(raw, RENDERER.comp_cur)
+            surf = pygame.image.frombuffer(raw.color_attachments[0].read(), (WIDTH, HEIGHT), "RGBA")
+            pygame.image.save(surf, "/tmp/gpu_frame.png")
+            print("[gpu] wrote /tmp/gpu_frame.png (headless smoke test)")
+            raw.release()
+            running = False
 
         pygame.display.flip()
     pygame.quit()
